@@ -1,0 +1,187 @@
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import streamlit as st
+import base64
+import os
+import io
+from PIL import Image 
+import pdf2image
+import google.generativeai as genai
+
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+
+def get_gemini_response(input, pdf_content, prompt):
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    response = model.generate_content(
+        [input, pdf_content[0], prompt], generation_config={"temperature": 0}
+    )
+    return response.text
+
+def input_pdf_setup(uploaded_file):
+    if uploaded_file is not None:
+        ## convert the pdf to image
+        images=pdf2image.convert_from_bytes(uploaded_file.read(), poppler_path=r"C:\poppler-24.08.0\Library\bin")
+
+        first_page=images[0]
+
+    
+
+    #convert to bytes
+        img_byte_arr = io.BytesIO()
+        first_page.save(img_byte_arr, format='JPEG')
+        img_byte_arr = img_byte_arr.getvalue()
+
+        pdf_parts =[
+            {
+                "mime_type": "image/jpeg",
+                "data": base64.b64encode(img_byte_arr).decode()  #encode to base64
+
+            }
+        ]
+        return pdf_parts
+    else:
+        raise FileNotFoundError("No file uploaded")
+
+
+
+# Apply Custom CSS for better styling
+st.markdown(
+    """
+    <style>
+
+    /* Custom Header Styling */
+    .stApp {
+        background-color: #1e1e1e;  /* Dark Theme */
+    }
+
+    h1 {
+        color: #ff416c;
+        text-align: center;
+        font-size: 36px;
+        font-weight: bold;
+    }
+
+    /* Styling for buttons */
+    .stButton > button {
+        border-radius: 12px;
+        background: linear-gradient(135deg, #ff416c, #ff4b2b);
+        color: white;
+        font-size: 16px;
+        padding: 10px 20px;
+        box-shadow: 3px 3px 5px rgba(255, 75, 43, 0.3);
+        border: none;
+    }
+    .stButton > button:hover {
+        background: linear-gradient(135deg, #ff4b2b, #ff416c);
+        box-shadow: 5px 5px 10px rgba(255, 75, 43, 0.5);
+    }
+
+    /* Text Area Styling */
+    textarea {
+        border-radius: 10px;
+        background: #222;
+        color: white;
+        padding: 10px;
+        border: 1px solid #ff4b2b;
+    }
+
+    /* File Uploader Styling */
+    .stFileUploader {
+        background: #333;
+        color: white;
+        border-radius: 10px;
+        padding: 10px;
+        border: 1px solid #ff4b2b;
+    }
+
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+st.markdown("<h1>📄 Resume Screening</h1>", unsafe_allow_html=True)
+
+# Create columns for side-by-side layout
+col1, col2 = st.columns([2, 1])  # Adjust width ratio
+
+with col1:
+    st.markdown("### 📝 Job Description")
+    input_text = st.text_area("Enter Job Description:", key="input")
+
+with col2:
+    st.markdown("### 📂 Upload Resume")
+    uploaded_file = st.file_uploader("Upload your resume (PDF)...", type=["pdf"])
+
+if uploaded_file is not None:
+    st.success("✅ PDF Uploaded Successfully!")
+
+
+
+if uploaded_file is not None:
+    st.write("PDF Uploaded Successfully")
+# Center-align buttons
+st.markdown("<div style='text-align: center;'>", unsafe_allow_html=True)
+
+col_btn1, col_btn2, col_btn3 = st.columns(3)
+
+with col_btn1:
+    submit1 = st.button("📄 Resume Analysis")
+
+with col_btn2:
+    submit2 = st.button("✅ Recruitable or Not")
+
+with col_btn3:
+    submit3 = st.button("📊 Percentage Match")
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+
+input_prompt1 = """
+You Are an experienced HR with tech experience in the field of Data science, full stack,
+ web development, big data engineering ,devops, data analyst, your task is to review 
+ the provided resume against the job description for these profiles.
+   please share your professional evaluation on whether the candidate profile aligns with the role.
+ highlight the strength and weakness of the applicant in relation to specified job requirements"""
+
+input_prompt3 ="""
+You are unskilled ATS (applicant tracking system) scanner with deep understanding of  Data science, full stack,
+ web development, big data engineering ,devops, data analyst, and deep ATS
+   functionality your task is to evaluate the resume against the provided job description give me the percentage of match if the  resume matches.
+  job description first the output should come as percentage and then keyword missing and last final thoughts"""
+
+input_prompt2 ="""
+"You are an expert ATS and HR professional specializing in Computer Science roles.
+ Analyze the provided resume against the given job description and determine if the applicant is a good fit.
+ Provide a clear verdict: 'Strong Fit,'  or 'Not a Fit.' Keep the response concise and objective."
+"""
+
+if submit1:
+    if uploaded_file is not None:
+        pdf_content = input_pdf_setup(uploaded_file)
+        response = get_gemini_response(input_prompt1, pdf_content, input_text)
+        st.subheader("The response is:")
+        st.write(response) 
+    else:
+        st.write("Please upload the resume")
+
+elif submit3:
+    if uploaded_file is not None:
+        pdf_content = input_pdf_setup(uploaded_file)
+        response = get_gemini_response(input_prompt3, pdf_content, input_text)
+        st.subheader("The response is:")
+        st.write(response) 
+    else:
+        st.write("Please upload the resume")
+
+elif submit2:
+    if uploaded_file is not None:
+        pdf_content = input_pdf_setup(uploaded_file)
+        response = get_gemini_response(input_prompt2, pdf_content, input_text)
+        st.subheader("The response is:")
+        st.write(response) 
+    else:
+        st.write("Please upload the resume")
+
+ 
