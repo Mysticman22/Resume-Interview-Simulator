@@ -1,5 +1,8 @@
 streamlit
 google-generativeai
+python-dotenv
 PyMuPDF
 gTTS
 reportlab
+pandas
+numpy
