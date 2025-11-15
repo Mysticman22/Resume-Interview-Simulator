@@ -1,6 +1,4 @@
-from dotenv import load_dotenv
-load_dotenv()
-
+import streamlit as st
 import streamlit as st
 import os
 import fitz  # PyMuPDF
@@ -198,7 +196,7 @@ init_db()
 #             ORIGINAL APP STARTS
 # ============================================
 
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+genai.configure(api_key=st.secrets("GOOGLE_API_KEY"))
 
 def get_gemini_response(input_text, pdf_content, prompt):
     model = genai.GenerativeModel("gemini-1.5-flash")
