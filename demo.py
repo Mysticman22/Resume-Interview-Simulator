@@ -1,6 +1,8 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import streamlit as st
-import streamlit as st
-import os
+import os 
 import fitz  # PyMuPDF
 import google.generativeai as genai
 from gtts import gTTS
@@ -196,7 +198,7 @@ init_db()
 #             ORIGINAL APP STARTS
 # ============================================
 
-genai.configure(api_key=st.secrets("GOOGLE_API_KEY"))
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 def get_gemini_response(input_text, pdf_content, prompt):
     model = genai.GenerativeModel("gemini-1.5-flash")
@@ -205,6 +207,8 @@ def get_gemini_response(input_text, pdf_content, prompt):
         generation_config={"temperature": 0}
     )
     return response.text
+
+
 
 def input_pdf_setup(uploaded_file):
     if uploaded_file is not None:
