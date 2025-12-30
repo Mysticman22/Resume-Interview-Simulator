@@ -1,0 +1,1043 @@
+from dotenv import load_dotenv
+load_dotenv()
+
+import streamlit as st
+import os
+import fitz  # PyMuPDF
+import google.generativeai as genai
+from gtts import gTTS
+import base64
+import tempfile
+import re
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+import random
+
+# ---------- NEW: DB + AUTH IMPORTS ----------
+import sqlite3
+import hashlib
+from datetime import datetime, date, timedelta
+from pathlib import Path
+
+# ============================================
+#                DB & AUTH LAYER
+# ============================================
+DB_PATH = "app_data.db"
+REPORTS_DIR = Path("reports")
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+    # Admin users table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS admin_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Interview reports table
+    # NOTE: added question_type column to store the selected type (e.g., "Technical", "HR", etc.)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS interview_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_name TEXT,
+            candidate_email TEXT,
+            job_description TEXT,
+            question_type TEXT,
+            report_text TEXT,
+            pdf_path TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+
+    # Migration for older DBs: add question_type if it doesn't exist
+    cur.execute("PRAGMA table_info(interview_reports)")
+    cols = [row["name"] for row in cur.fetchall()]
+    if "question_type" not in cols:
+        # Add the new column; SQLite allows ADD COLUMN
+        cur.execute("ALTER TABLE interview_reports ADD COLUMN question_type TEXT")
+        conn.commit()
+
+    # Seed default admin if not exists
+    cur.execute("SELECT COUNT(*) AS c FROM admin_users")
+    if cur.fetchone()["c"] == 0:
+        default_user = "admin"
+        default_pass = "admin123"
+        cur.execute(
+            "INSERT INTO admin_users (username, password_hash) VALUES (?, ?)",
+            (default_user, hash_password(default_pass))
+        )
+        conn.commit()
+    conn.close()
+
+def hash_password(pw: str) -> str:
+    # Simple SHA256 (for demo). For production, replace with bcrypt/argon2.
+    return hashlib.sha256(pw.encode("utf-8")).hexdigest()
+
+def verify_password(raw_pw: str, pw_hash: str) -> bool:
+    return hash_password(raw_pw) == pw_hash
+
+def admin_login(username: str, password: str) -> bool:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM admin_users WHERE username = ?", (username,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return False
+    return verify_password(password, row["password_hash"])
+
+def save_report_to_db(candidate_name: str, candidate_email: str, job_desc: str, report_text: str, pdf_path: str, question_type: str = None):
+    """
+    NOTE: added question_type parameter so each saved report records the interview type.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO interview_reports
+        (candidate_name, candidate_email, job_description, question_type, report_text, pdf_path, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (candidate_name, candidate_email, job_desc, question_type, report_text, pdf_path, datetime.now())
+    )
+    conn.commit()
+    conn.close()
+
+def fetch_reports(search: str = "", qtype: str = None, start_date: date = None, end_date: date = None):
+    """
+    Fetch reports. If qtype provided (and not "All"), filter by question_type.
+    Optionally filter by start_date and end_date (date objects).
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    params = []
+    clauses = []
+    if search:
+        like = f"%{search}%"
+        clauses.append("(candidate_name LIKE ? OR candidate_email LIKE ?)")
+        params.extend([like, like])
+    if qtype and qtype != "All":
+        clauses.append("question_type = ?")
+        params.append(qtype)
+    if start_date:
+        # include entire day start
+        clauses.append("created_at >= ?")
+        params.append(start_date.strftime("%Y-%m-%d") + " 00:00:00")
+    if end_date:
+        # include entire day end
+        clauses.append("created_at <= ?")
+        params.append(end_date.strftime("%Y-%m-%d") + " 23:59:59")
+    where_clause = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    query = f"SELECT * FROM interview_reports {where_clause} ORDER BY created_at DESC"
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def fetch_distinct_question_types_with_counts():
+    """
+    Returns list of tuples: (question_type, count) ordered by count desc
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT question_type, COUNT(*) as cnt
+        FROM interview_reports
+        WHERE question_type IS NOT NULL AND question_type != ''
+        GROUP BY question_type
+        ORDER BY cnt DESC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    return [(r["question_type"], r["cnt"]) for r in rows if r["question_type"]]
+
+# Initialize DB once
+init_db()
+
+# ============================================
+#             ORIGINAL APP STARTS
+# ============================================
+
+# Configure Google Gemini API
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+
+def get_gemini_response(input_text, pdf_content, prompt):
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    response = model.generate_content(
+        [input_text, pdf_content, prompt],
+        generation_config={"temperature": 0}
+    )
+    return response.text
+
+def input_pdf_setup(uploaded_file):
+    if uploaded_file is not None:
+        doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+        full_text = ""
+        for page in doc:
+            full_text += page.get_text()
+        return full_text
+    else:
+        raise FileNotFoundError("No file uploaded")
+
+# ------------------ CUSTOM CSS & THEME (PURPLE ACCENT + BREATHING) ------------------ #
+st.set_page_config(page_title="Resume Screening", layout="wide")
+
+custom_css = r"""
+/* Google fonts */
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700&family=Inter:wght@300;400;600&display=swap');
+
+:root{
+  --bg-1: #071021;
+  --bg-2: #041426;
+  --accent-1: #7C4DFF; /* purple accent */
+  --accent-2: #ff6b88;
+  --button-text: #ffffff;
+  --glass: rgba(255,255,255,0.04);
+  --muted: rgba(255,255,255,0.65);
+  --breathe-duration: 4s;
+  --breathe-ease: cubic-bezier(.4,0,.2,1);
+}
+
+/* Main background */
+.stApp, .main, .block-container {
+    font-family: 'Poppins', 'Inter', sans-serif;
+    background: radial-gradient(1200px 600px at 10% 10%, rgba(124,77,255,0.03), transparent 6%),
+                radial-gradient(1000px 500px at 90% 90%, rgba(255,107,136,0.03), transparent 6%),
+                linear-gradient(180deg, var(--bg-1), var(--bg-2));
+    color: #e9f3f2;
+    -webkit-font-smoothing: antialiased;
+    padding-top: 18px;
+}
+
+/* Header heroic area */
+.header-hero {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:16px;
+    padding: 18px 24px;
+    border-radius: 14px;
+    background: linear-gradient(135deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
+    box-shadow: 0 8px 30px rgba(2,6,23,0.6), inset 0 -1px 0 rgba(255,255,255,0.02);
+    margin-bottom: 18px;
+}
+
+/* Brand */
+.brand {
+    display:flex;
+    align-items:center;
+    gap:16px;
+}
+.brand .logo {
+    width:64px; height:64px; border-radius:14px;
+    background: linear-gradient(135deg, #b99bff, #8a6bff);
+    display:flex; align-items:center; justify-content:center;
+    font-weight:700; color:#021018; font-size:28px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.7);
+    /* breathing on logo */
+    animation: breathe-logo var(--breathe-duration) var(--breathe-ease) infinite;
+    transform-origin: center center;
+}
+.brand h1 { margin:0; font-size:28px; color:transparent; 
+  background: linear-gradient(90deg, #ffd1e0, #bdb3ff); -webkit-background-clip: text; background-clip: text; font-weight:700; }
+.brand p { margin:0; color:var(--muted); font-size:13px; }
+
+/* Header actions */
+.header-actions { display:flex; gap:8px; align-items:center; }
+
+/* Glass card wrapper */
+.glass-card {
+    background: linear-gradient(135deg, rgba(255,255,255,0.02), rgba(255,255,255,0.015));
+    border-radius: 12px;
+    padding: 18px;
+    box-shadow: 0 10px 30px rgba(2,6,23,0.6);
+    border: 1px solid rgba(255,255,255,0.03);
+}
+
+/* Inputs */
+.stTextInput, .stTextArea, textarea, input, select {
+    border-radius: 10px !important;
+    background: linear-gradient(180deg, rgba(255,255,255,0.01), rgba(255,255,255,0.02));
+    border: 1px solid rgba(255,255,255,0.04) !important;
+    padding: 12px !important;
+    color: #e9f3f2 !important;
+    font-family: 'Inter', sans-serif;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
+}
+
+/* File uploader */
+.stFileUploader > div, .stFileUploader {
+    background: linear-gradient(180deg, rgba(255,255,255,0.015), rgba(255,255,255,0.01));
+    border-radius: 12px;
+    padding: 8px;
+    border: 1px dashed rgba(255,255,255,0.04);
+    box-shadow: none;
+}
+
+/* Buttons: pills with purple gradient + breathing */
+.stButton > button {
+    min-width: 170px;
+    height: 52px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--accent-1) 0%, #9a7aff 45%, var(--accent-2) 100%);
+    color: var(--button-text) !important;
+    font-weight: 700;
+    font-size: 15px;
+    padding: 10px 18px;
+    box-shadow: 0 10px 30px rgba(90,50,200,0.28), 0 2px 6px rgba(0,0,0,0.25);
+    border: none;
+    transition: transform .18s ease, box-shadow .18s ease, filter .18s ease;
+    /* breathing */
+    animation: breathe-btn var(--breathe-duration) var(--breathe-ease) infinite;
+    transform-origin: center center;
+}
+.stButton > button:hover {
+    transform: translateY(-6px) scale(1.03);
+    box-shadow: 0 20px 46px rgba(90,50,200,0.36);
+    filter: brightness(1.04);
+}
+
+/* Badge breathing */
+.badge {
+    display:inline-block;
+    padding:6px 10px;
+    border-radius:999px;
+    background: linear-gradient(90deg, rgba(124,77,255,0.12), rgba(255,107,136,0.06));
+    color: #e9f3f2;
+    font-weight:600;
+    font-size:13px;
+    animation: breathe-badge calc(var(--breathe-duration) * 1.1) var(--breathe-ease) infinite;
+}
+
+/* Headings */
+h1, h2, h3 { font-family: 'Poppins', sans-serif; }
+h1 { font-size: 36px; margin: 4px 0; }
+h2 { font-size: 22px; margin: 8px 0; color:#bfeee7; }
+h3 { font-size: 18px; color:#dffcf8; }
+
+/* Cards inside columns */
+.card {
+    padding:16px;
+    border-radius:12px;
+    background: linear-gradient(180deg, rgba(255,255,255,0.01), rgba(255,255,255,0.015));
+    border: 1px solid rgba(255,255,255,0.03);
+    box-shadow: 0 8px 24px rgba(2,6,23,0.55);
+}
+
+/* Progress / small text */
+.small-muted { color: rgba(255,255,255,0.6); font-size:13px; }
+
+/* Admin sidebar tweaks */
+.sidebar .stButton > button { border-radius: 10px; }
+
+/* Download button override */
+.stDownloadButton > button {
+    border-radius: 999px;
+    padding: 10px 16px;
+    background: linear-gradient(90deg, #ffd1e0 0%, #d8cfff 100%);
+    color: #051018;
+    font-weight:700;
+}
+
+/* Expander styling */
+[data-testid="stExpander"] {
+    border-radius: 10px;
+    background: linear-gradient(180deg, rgba(255,255,255,0.01), rgba(255,255,255,0.005));
+    border: 1px solid rgba(255,255,255,0.02);
+}
+
+/* hide default footer */
+footer { visibility: hidden; }
+
+/* subtle floating animation for hero logo is already applied above */
+
+/* ------------------------
+   Breathing keyframes
+   ------------------------ */
+@keyframes breathe-btn {
+  0% {
+    transform: scale(1) translateY(0);
+    box-shadow: 0 10px 30px rgba(90,50,200,0.22);
+    filter: saturate(1);
+  }
+  50% {
+    transform: scale(1.02) translateY(-2px);
+    box-shadow: 0 18px 42px rgba(124,77,255,0.32);
+    filter: saturate(1.03);
+  }
+  100% {
+    transform: scale(1) translateY(0);
+    box-shadow: 0 10px 30px rgba(90,50,200,0.22);
+    filter: saturate(1);
+  }
+}
+
+@keyframes breathe-logo {
+  0% {
+    transform: translateY(0) scale(1);
+    box-shadow: 0 8px 30px rgba(0,0,0,0.6);
+  }
+  50% {
+    transform: translateY(-4px) scale(1.03);
+    box-shadow: 0 18px 46px rgba(124,77,255,0.18);
+  }
+  100% {
+    transform: translateY(0) scale(1);
+    box-shadow: 0 8px 30px rgba(0,0,0,0.6);
+  }
+}
+
+@keyframes breathe-badge {
+  0% {
+    transform: scale(1);
+    opacity: 1;
+    box-shadow: 0 6px 18px rgba(124,77,255,0.06);
+  }
+  50% {
+    transform: scale(1.04);
+    opacity: 0.96;
+    box-shadow: 0 12px 30px rgba(124,77,255,0.12);
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+    box-shadow: 0 6px 18px rgba(124,77,255,0.06);
+  }
+}
+
+/* responsive tweaks */
+@media (max-width: 900px) {
+    .brand h1 { font-size:20px; }
+    .stButton > button { min-width: 140px; height:44px; font-size:14px; }
+}
+"""
+st.markdown(f"<style>{custom_css}</style>", unsafe_allow_html=True)
+
+# small hero HTML (purely presentational)
+hero_html = """
+<div class="header-hero glass-card">
+  <div class="brand">
+    <div class="logo">RS</div>
+    <div>
+      <h1>Resume Screening</h1>
+      <p class="small-muted">Fast. Smooth. Insightful — interview & ATS reports.</p>
+    </div>
+  </div>
+  <div class="header-actions">
+    <div class="badge">Live Interview</div>
+    <div class="small-muted">Built for hiring teams</div>
+  </div>
+</div>
+"""
+st.markdown(hero_html, unsafe_allow_html=True)
+
+# ---------- NEW: SIDEBAR ADMIN NAV ----------
+st.sidebar.title("Resume Screening")
+st.sidebar.markdown("### How to Use:")
+st.sidebar.markdown("""
+1. **Enter the Job Description**  
+2. **Upload multiple PDF Resumes**  
+3. Click an **Analysis Button**  
+4. Or try the **Live Interview Mode** 🎬  
+""")
+
+st.sidebar.markdown("---")
+if "admin_authenticated" not in st.session_state:
+    st.session_state.admin_authenticated = False
+
+if not st.session_state.admin_authenticated:
+    with st.sidebar.expander("👮 Admin Login"):
+        admin_user = st.text_input("Username", key="adm_user")
+        admin_pass = st.text_input("Password", type="password", key="adm_pass")
+        if st.button("Login as Admin"):
+            if admin_login(admin_user, admin_pass):
+                st.session_state.admin_authenticated = True
+                st.session_state.admin_username = admin_user
+                st.success("Admin login successful.")
+                st.rerun()
+            else:
+                st.error("Invalid admin credentials.")
+else:
+    st.sidebar.success(f"Logged in as: {st.session_state.get('admin_username', 'admin')}")
+    if st.sidebar.button("Logout"):
+        st.session_state.admin_authenticated = False
+        st.session_state.admin_username = None
+        st.rerun()
+
+# ------------------ PAGE ROUTING ------------------ #
+query_params = st.query_params
+page = query_params.get("page", "home")
+
+# ------------------ HOME PAGE ------------------ #
+if page == "home":
+    # main grid: left (job desc + actions) and right (uploader)
+    col1, col2 = st.columns([2, 1], gap="large")
+
+    with col1:
+        st.markdown('<div class="glass-card card">', unsafe_allow_html=True)
+        st.markdown("### 📝 Job Description")
+        input_text = st.text_area("Enter Job Description:", key="input", height=200)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown('<div style="height:14px"></div>', unsafe_allow_html=True)
+
+        # action buttons row
+        st.markdown('<div class="glass-card" style="padding:14px">', unsafe_allow_html=True)
+        st.markdown("<div style='display:flex;gap:12px;flex-wrap:wrap;'>", unsafe_allow_html=True)
+        col_btn1, col_btn2, col_btn3, col_btn4, col_btn5 = st.columns([1, 1, 1, 1, 1], gap="small")
+        with col_btn1:
+            submit1 = st.button("📄 Resume Analysis")
+        with col_btn2:
+            submit2 = st.button("✅ Recruitable or Not")
+        with col_btn3:
+            submit3 = st.button("📊 Percentage Match")
+        with col_btn4:
+            submit4 = st.button("🌟 Quality ")
+        with col_btn5:
+            submit5 = st.button("🎤 Interview")
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with col2:
+        st.markdown('<div class="glass-card card">', unsafe_allow_html=True)
+        st.markdown("### 📂 Upload Resumes")
+        uploaded_files = st.file_uploader("Upload resumes (PDF)...", type=["pdf"], accept_multiple_files=True)
+        st.markdown('<div class="small-muted" style="margin-top:8px">Tip: Drag & drop multiple resumes</div>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if uploaded_files:
+        st.success(f"✅ {len(uploaded_files)} PDF(s) Uploaded Successfully!")
+
+        if "resumes_text" not in st.session_state:
+            st.session_state.resumes_text = {}
+        for f in uploaded_files:
+            if f.name not in st.session_state.resumes_text:
+                st.session_state.resumes_text[f.name] = input_pdf_setup(f)
+
+        st.session_state.job_desc = input_text
+
+    # Live Interview nav + admin dashboard link
+    left_col, right_col = st.columns([2, 1])
+    with left_col:
+        if st.button("🎬 Live Interview", key="live", help="Start interactive interview session"):
+            if "resumes_text" in st.session_state and st.session_state.resumes_text:
+                st.query_params["page"] = "live"
+            else:
+                st.error("⚠️ Please upload at least one resume before starting Live Interview.")
+    with right_col:
+        if st.session_state.admin_authenticated:
+            if st.button("🗂️ Open Admin Dashboard"):
+                st.query_params["page"] = "admin"
+
+    # Prompts (unchanged)
+    input_prompt1 = """
+You are an experienced HR professional with expertise in Computer Science, Mechanical, Civil, Electronics and Telecommunication, and Electrical Engineering.
+Your task is to review job descriptions and corresponding resumes, and then:
+
+Analyze how well each resume aligns with the job description.
+
+Highlight the strengths and weaknesses of each candidate in relation to the job requirements.
+"""
+
+    input_prompt3 = """
+You are an ATS scanner with expertise . Evaluate  job description and each resume,
+aligns the job description, provide a percentage match, list missing keywords,
+and share your thoughts,.
+"""
+
+    input_prompt2 = """
+You are an expert  ATS scanner .
+Analyze  job description each resume and determine if the applicant is a 'Strong Fit' or 'Not a Fit' depending on job description  .
+just tell fit or not 
+,dont give extra output.if job description is not provided, remind to provide , for better result
+"""
+
+    input_prompt4 =""" You are  an expert in English and formats for resume .
+your job is to analyze the clarity ,formatting, spelling mistake and grammar in the resume ,
+give explaination for each clarity,formatting ,spelling mistake and grammar.
+keep proper spacing between lines for each paragraph.
+."""
+
+    input_prompt5 = """You are an experienced interviewer..."""
+
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            pdf_content = st.session_state.resumes_text[uploaded_file.name]
+
+            if submit1:
+                response = get_gemini_response(input_prompt1, pdf_content, input_text)
+                st.subheader(f"📄 Analysis for {uploaded_file.name}")
+                st.write(response)
+
+            if submit3:
+                response = get_gemini_response(input_prompt3, pdf_content, input_text)
+                st.subheader(f"📊 Percentage Match for {uploaded_file.name}")
+                st.write(response)
+
+            if submit2:
+                response = get_gemini_response(input_prompt2, pdf_content, input_text)
+                st.subheader(f"✅ Recruitability for {uploaded_file.name}")
+                st.write(response)
+
+            if submit4:
+                response = get_gemini_response(input_prompt4, pdf_content, input_text)
+                st.subheader(f"✅ Quality for {uploaded_file.name}")
+                st.write(response)
+
+            if submit5:
+                response = get_gemini_response(input_prompt5, pdf_content, input_text)
+                st.subheader(f"🎤 Interview Questions for {uploaded_file.name}")
+                st.write(response)
+
+# ------------------ LIVE INTERVIEW PAGE ------------------ #
+elif page == "live":
+    st.markdown('<h1 style="color:#7C4DFF;">🎬 Live Interview Session</h1>', unsafe_allow_html=True)
+    st.write("Answer all 10 interview questions below. Each will have audio + text. After submitting, you'll receive detailed feedback and a PDF report.")
+
+    # Show the tip only once at the start
+    if "live_tip_shown" not in st.session_state:
+        st.info("💡 Tip: Select the text box and press **Windows + H** to use voice input.")
+        st.session_state.live_tip_shown = True
+
+    if st.button("⬅️ Back to Home"):
+        st.query_params["page"] = "home"
+        st.rerun()
+
+    # ---------- NEW: Candidate info for report ownership ----------
+    st.markdown("### 👤 Candidate Details")
+    candidate_name = st.text_input("Full Name", key="cand_name")
+    candidate_email = st.text_input("Email", key="cand_email")
+
+    # Define question types
+    question_types = ["Personal", "Technical", "Company or Role Specific", "Case Study", "Aptitude", "HR"]
+
+    # Initialize session state for interactive flow
+    if "questions" not in st.session_state:
+        st.session_state.questions = []
+    if "answers" not in st.session_state:
+        st.session_state.answers = []
+    if "feedback" not in st.session_state:
+        st.session_state.feedback = []
+    if "scores" not in st.session_state:
+        st.session_state.scores = []
+    if "current_q_index" not in st.session_state:
+        st.session_state.current_q_index = 0
+    if "interview_finished" not in st.session_state:
+        st.session_state.interview_finished = False
+    if "current_type" not in st.session_state:
+        st.session_state.current_type = None
+    # NEW: track saved reports to avoid duplicates
+    if "saved_reports" not in st.session_state:
+        # key: f"{candidate_email}_{question_type}" -> pdf_path
+        st.session_state.saved_reports = {}
+
+    # Select the first resume's text as interview basis
+    if "resumes_text" in st.session_state and st.session_state.resumes_text:
+        first_resume = list(st.session_state.resumes_text.values())[0]
+    else:
+        st.warning("⚠️ Please go back and upload at least one resume.")
+        st.stop()
+
+    # Helper: create TTS audio markup for a prompt
+    def audio_player_for_text(text: str, q_index: int):
+        tts = gTTS(text=text, lang="en")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_q{q_index}.mp3") as tmp_file:
+            tts.save(tmp_file.name)
+            temp_path = tmp_file.name
+        with open(temp_path, "rb") as audio_file:
+            audio_bytes = audio_file.read()
+            b64 = base64.b64encode(audio_bytes).decode()
+            st.markdown(
+                f"""
+                <audio controls src="data:audio/mpeg;base64,{b64}">
+                    Your browser does not support the audio element.
+                </audio>
+                """,
+                unsafe_allow_html=True
+            )
+
+    # Helper: generate first question
+    def generate_first_question():
+        q_prompt = f"""
+        You are an experienced technical interviewer.
+        Based on the following job description and resume, generate exactly 10 clear interview questions of type: {st.session_state.current_type.lower()} questions.
+        Mix technical, behavioral, and situational questions where appropriate for the type.
+        Format as a simple numbered list (1. , 2. , 3. ...).
+
+        Job Description: {st.session_state.get("job_desc", "")}
+        Resume: {first_resume}
+        """
+        response = get_gemini_response("", "", q_prompt)
+        questions = [q.strip(" .") for q in response.split("\n") if q.strip() and q.strip()[0].isdigit()]
+        return questions[0] if questions else "Tell me about a project you are most proud of and why."
+
+    # Helper: generate next question
+    def generate_next_question(prev_q, prev_a):
+        tried = 0
+        while tried < 3:
+            depend_on_answer = random.choice([True, False])
+            if depend_on_answer:
+                prompt = f"""
+                You are an experienced technical interviewer.
+                Based on the job description and resume, and the candidate's last answer, ask ONE logical follow-up interview question of type: {st.session_state.current_type.lower()} question.
+                Keep it concise and focused. Do not include any numbering or extra text.
+
+                Job Description: {st.session_state.get("job_desc", "")}
+                Resume: {first_resume}
+
+                Previous Question: {prev_q}
+                Candidate's Answer: {prev_a}
+                """
+            else:
+                prompt = f"""
+                You are an experienced technical interviewer.
+                Without relying on the previous answer, ask ONE new interview question of type: {st.session_state.current_type.lower()} question that evaluates another important area for this role.
+                Keep it concise and focused. Do not include any numbering or extra text.
+
+                Job Description: {st.session_state.get("job_desc", "")}
+                Resume: {first_resume}
+                """
+            response = get_gemini_response("", "", prompt).strip()
+            line = re.sub(r"^\s*\d+[\).\s-]*", "", response).strip()
+            if line and line.lower() not in [q.lower() for q in st.session_state.questions]:
+                return line
+            tried += 1
+        return "What is a challenging problem you solved recently, and how did you approach it?"
+
+    # Helper: evaluate answer
+    def evaluate_answer(question, answer):
+        eval_prompt = f"""
+            Evaluate this interview answer.
+            Question: {question}
+            Answer: {answer}
+
+            Give:
+            1. Constructive feedback
+            2. A score out of 10
+            """
+        feedback = get_gemini_response("", "", eval_prompt)
+        score_match = re.search(r"(\d+(\.\d+)?)/10", feedback)
+        score = float(score_match.group(1)) if score_match else None
+        return feedback, score
+
+    # ---------- UPDATED: build PDF (save under ./reports and return full path) ----------
+    def create_pdf(filename="Interview_Report.pdf"):
+        # Ensure reports dir exists
+        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        full_path = REPORTS_DIR / filename
+
+        # if file already exists, append timestamp to avoid overwrite collisions
+        if full_path.exists():
+            ts = datetime.now().strftime("%Y%m%d%H%M%S")
+            full_path = REPORTS_DIR / f"{full_path.stem}_{ts}{full_path.suffix}"
+
+        doc = SimpleDocTemplate(str(full_path))
+        styles = getSampleStyleSheet()
+        story = []
+        story.append(Paragraph("Interview Report", styles['Title']))
+        story.append(Spacer(1, 12))
+        story.append(Paragraph(f"Type: {st.session_state.current_type}", styles['Heading1']))
+        story.append(Spacer(1, 12))
+        for i, (q, ans, fb, sc) in enumerate(zip(st.session_state.questions, st.session_state.answers, st.session_state.feedback, st.session_state.scores), 1):
+            story.append(Paragraph(f"Q{i}: {q}", styles['Heading2']))
+            story.append(Paragraph(f"Answer: {ans}", styles['Normal']))
+            story.append(Paragraph(f"Feedback: {fb}", styles['Normal']))
+            story.append(Paragraph(f"Score: {sc if sc else 'N/A'} / 10", styles['Normal']))
+            story.append(Spacer(1, 12))
+        if any(st.session_state.scores):
+            existing_scores = [s for s in st.session_state.scores if s is not None]
+            if existing_scores:
+                avg_score = sum(existing_scores) / len(existing_scores)
+                story.append(Paragraph(f"Final Score: {avg_score:.1f} / 10", styles['Heading1']))
+        doc.build(story)
+        return str(full_path)
+
+    # If current_type is None, prompt to select type
+    if st.session_state.current_type is None:
+        st.markdown("### Select Interview Question Type")
+        selected_type = st.selectbox("Choose the type of questions:", question_types)
+        if st.button("Start Interview for Selected Type"):
+            st.session_state.current_type = selected_type
+            st.session_state.questions = []
+            st.session_state.answers = []
+            st.session_state.feedback = []
+            st.session_state.scores = []
+            st.session_state.current_q_index = 0
+            st.session_state.interview_finished = False
+            st.rerun()
+
+        # Allow ending before starting
+        if st.button("End Interview"):
+            st.query_params["page"] = "home"
+            st.rerun()
+        st.stop()
+
+    # Ensure first question exists
+    if st.session_state.current_q_index == 0 and len(st.session_state.questions) == 0:
+        first_q = generate_first_question()
+        st.session_state.questions.append(first_q)
+
+    # If finished, show report and download
+    if st.session_state.interview_finished:
+        st.success("🎉 Interview Finished for this type! Here's your report:")
+        for i, (q, ans, fb, sc) in enumerate(zip(st.session_state.questions, st.session_state.answers, st.session_state.feedback, st.session_state.scores), 1):
+            st.markdown(f"<h3 style='color:#b99bff;'>Q{i}: {q}</h3>", unsafe_allow_html=True)
+            st.write(f"📝 Your Answer: {ans}")
+            st.write(f"💡 Feedback: {fb}")
+            st.write(f"⭐ Score: {sc if sc else 'N/A'} / 10")
+            st.write("---")
+        if any(st.session_state.scores):
+            existing_scores = [s for s in st.session_state.scores if s is not None]
+            if existing_scores:
+                avg_score = sum(existing_scores) / len(existing_scores)
+                st.subheader(f"🏆 Final Score: {avg_score:.1f} / 10")
+
+        # Ask user for file name
+        file_name_input = st.text_input("Enter file name for the PDF report (without extension):", value=f"Interview_Report_{st.session_state.current_type.replace(' ', '_')}")
+
+        # ---------- NEW: Avoid duplicate DB insert / duplicate downloads ----------
+        if st.button("📥 Download Report as PDF"):
+            if not candidate_name or not candidate_email:
+                st.error("Please enter your Name and Email before downloading.")
+            else:
+                # Key to avoid duplicate saves for same candidate + question type in this session
+                save_key = f"{candidate_email.strip().lower()}_{st.session_state.current_type.strip()}"
+                requested_filename = f"{file_name_input}.pdf"
+
+                # If already saved in this session, reuse existing path and do not save again
+                if save_key in st.session_state.saved_reports:
+                    existing_path = st.session_state.saved_reports[save_key]
+                    if os.path.exists(existing_path):
+                        st.info("Report was already generated and saved. Providing download.")
+                        with open(existing_path, "rb") as f:
+                            file_bytes = f.read()
+                            st.download_button(f"Download '{os.path.basename(existing_path)}'", file_bytes, file_name=os.path.basename(existing_path))
+                    else:
+                        # file missing on disk; regenerate and update DB (safe fallback)
+                        pdf_file_path = create_pdf(filename=requested_filename)
+
+                        # Build a plain text summary to store in DB
+                        lines = [f"Type: {st.session_state.current_type}\n"]
+                        for i, (q, a, fb, sc) in enumerate(zip(st.session_state.questions, st.session_state.answers, st.session_state.feedback, st.session_state.scores), 1):
+                            lines.append(f"Q{i}: {q}\nAnswer: {a}\nFeedback: {fb}\nScore: {sc if sc else 'N/A'}/10\n")
+                        report_text_blob = "\n".join(lines)
+
+                        # SAVE TO DB (auto-upload) - now includes question_type
+                        save_report_to_db(
+                            candidate_name=candidate_name.strip(),
+                            candidate_email=candidate_email.strip(),
+                            job_desc=st.session_state.get("job_desc", ""),
+                            report_text=report_text_blob,
+                            pdf_path=pdf_file_path,
+                            question_type=st.session_state.current_type  # <-- saved here
+                        )
+                        st.session_state.saved_reports[save_key] = pdf_file_path
+                        with open(pdf_file_path, "rb") as f:
+                            file_bytes = f.read()
+                            st.download_button(f"Download '{os.path.basename(pdf_file_path)}'", file_bytes, file_name=os.path.basename(pdf_file_path))
+                else:
+                    # Not saved yet in this session: create, save, record in session_state
+                    pdf_file_path = create_pdf(filename=requested_filename)
+
+                    # Build a plain text summary to store in DB
+                    lines = [f"Type: {st.session_state.current_type}\n"]
+                    for i, (q, a, fb, sc) in enumerate(zip(st.session_state.questions, st.session_state.answers, st.session_state.feedback, st.session_state.scores), 1):
+                        lines.append(f"Q{i}: {q}\nAnswer: {a}\nFeedback: {fb}\nScore: {sc if sc else 'N/A'}/10\n")
+                    report_text_blob = "\n".join(lines)
+
+                    # SAVE TO DB (auto-upload) - now includes question_type
+                    save_report_to_db(
+                        candidate_name=candidate_name.strip(),
+                        candidate_email=candidate_email.strip(),
+                        job_desc=st.session_state.get("job_desc", ""),
+                        report_text=report_text_blob,
+                        pdf_path=pdf_file_path,
+                        question_type=st.session_state.current_type  # <-- saved here
+                    )
+
+                    # record saved path so repeated clicks don't create duplicates
+                    st.session_state.saved_reports[save_key] = pdf_file_path
+
+                    # Provide download (send bytes so Streamlit doesn't re-run and re-generate inadvertently)
+                    with open(pdf_file_path, "rb") as f:
+                        file_bytes = f.read()
+                        st.download_button(f"Download '{os.path.basename(pdf_file_path)}'", file_bytes, file_name=os.path.basename(pdf_file_path))
+
+        # Options after download
+        if st.button("Continue with Another Type"):
+            st.session_state.current_type = None
+            st.session_state.questions = []
+            st.session_state.answers = []
+            st.session_state.feedback = []
+            st.session_state.scores = []
+            st.session_state.current_q_index = 0
+            st.session_state.interview_finished = False
+            st.rerun()
+
+        if st.button("End Interview"):
+            st.query_params["page"] = "home"
+            st.rerun()
+
+        st.stop()
+
+    # Current question index and text
+    i = st.session_state.current_q_index
+    current_question = st.session_state.questions[i]
+
+    # Show current question (bigger text + audio)
+    st.markdown(f"<h2 style='color:#b99bff;'>❓ Question {i+1} of 10 (Type: {st.session_state.current_type})</h2>", unsafe_allow_html=True)
+    st.markdown(f"<p style='font-size:30px;'>{current_question}</p>", unsafe_allow_html=True)
+    audio_player_for_text(current_question, i)
+
+    # Answer input
+    ans_key = f"ans_input_{i}"
+    ans = st.text_area(f"✍️ Your Answer to Q{i+1}", key=ans_key)
+
+    # Submit current answer
+    if st.button("✅ Submit Answer"):
+        st.session_state.answers.append(ans)
+        fb, sc = evaluate_answer(current_question, ans)
+        st.session_state.feedback.append(fb)
+        st.session_state.scores.append(sc)
+
+        if len(st.session_state.questions) < 10:
+            next_q = generate_next_question(current_question, ans)
+            st.session_state.questions.append(next_q)
+
+        st.session_state.current_q_index += 1
+
+        if st.session_state.current_q_index >= 10:
+            st.session_state.interview_finished = True
+
+        st.rerun()
+
+    # Optional: preview progress
+    with st.expander("📘 Progress so far"):
+        for idx in range(len(st.session_state.answers)):
+            st.markdown(f"**Q{idx+1}:** {st.session_state.questions[idx]}")
+            st.markdown(f"**Your Answer:** {st.session_state.answers[idx]}")
+            st.markdown(f"**Feedback:** {st.session_state.feedback[idx]}")
+            st.markdown(f"**Score:** {st.session_state.scores[idx] if st.session_state.scores[idx] else 'N/A'} / 10")
+            st.markdown("---")
+
+# ------------------ NEW: ADMIN DASHBOARD PAGE ------------------ #
+elif page == "admin":
+    st.markdown('<h1 style="color:#b99bff;">🗂️ Admin Dashboard</h1>', unsafe_allow_html=True)
+
+    if not st.session_state.admin_authenticated:
+        st.error("Admin access only. Please login from the sidebar.")
+        st.stop()
+
+    # New: allow selecting which question type to view (or All) with counts
+    st.markdown("### Filter reports by type")
+    types_with_counts = fetch_distinct_question_types_with_counts()
+    # Build labels "Type (count)"
+    available_type_labels = [f"{t} ({c})" for (t, c) in types_with_counts]
+    options = ["All"] + available_type_labels
+
+    # keep previously selected in session_state for UX
+    if "admin_selected_qtype_label" not in st.session_state:
+        st.session_state.admin_selected_qtype_label = "All"
+
+    selected_label = st.selectbox(
+        "Select question type to display",
+        options,
+        index=options.index(st.session_state.admin_selected_qtype_label) if st.session_state.admin_selected_qtype_label in options else 0
+    )
+    st.session_state.admin_selected_qtype_label = selected_label
+
+    # Map label back to raw qtype (strip the " (N)" suffix). If All -> qtype=None
+    if selected_label == "All":
+        selected_qtype = None
+    else:
+        # split on " (" to be safe
+        selected_qtype = selected_label.split(" (")[0].strip()
+
+    st.markdown("---")
+
+    # Date range filter toggle
+    use_date_filter = st.checkbox("Enable date-range filter", value=False)
+    start_date = None
+    end_date = None
+    if use_date_filter:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            start_date = st.date_input("Start date", value=(date.today() - timedelta(days=30)))
+        with col_b:
+            end_date = st.date_input("End date", value=date.today())
+        if start_date and end_date and start_date > end_date:
+            st.error("Start date cannot be after end date.")
+            st.stop()
+
+    # Search box
+    search = st.text_input("Search by candidate name or email:", "")
+
+    # Buttons for convenience: Clear filters
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("Clear Filters"):
+            st.session_state.admin_selected_qtype_label = "All"
+            # reset search and date filter by rerun with cleared inputs (we can't directly reset st.text_input here)
+            # easiest is to re-run and let user re-enter.
+            st.rerun()
+    with col2:
+        # Optionally show counts per type summary
+        if st.button("Refresh Counts"):
+            # just re-run to refresh counts from DB
+            st.rerun()
+
+    # Fetch rows with filters
+    rows = fetch_reports(search=search, qtype=selected_qtype, start_date=start_date, end_date=end_date)
+
+    if not rows:
+        st.info("No reports found.")
+    else:
+        for r in rows:
+            st.markdown("---")
+            st.markdown(f"**Candidate:** {r['candidate_name']}  \n**Email:** {r['candidate_email']}  \n**Type:** {r['question_type'] or 'N/A'}  \n**Date:** {r['created_at']}")
+            with st.expander("View report text"):
+                st.text(r["report_text"] or "")
+            pdf_path = r["pdf_path"]
+            col_download, col_delete = st.columns([1, 1])
+            with col_download:
+                if pdf_path and os.path.exists(pdf_path):
+                    with open(pdf_path, "rb") as f:
+                        st.download_button("⬇️ Download PDF", f.read(), file_name=os.path.basename(pdf_path), key=f"d_{r['id']}")
+                else:
+                    st.warning("PDF file not found on server.")
+            with col_delete:
+                if st.button("🗑️ Delete Report", key=f"del_{r['id']}"):
+                    try:
+                        # Delete DB row
+                        conn = get_db()
+                        cur = conn.cursor()
+                        cur.execute("DELETE FROM interview_reports WHERE id = ?", (r["id"],))
+                        conn.commit()
+                        conn.close()
+                        # Delete pdf file if exists
+                        if pdf_path and os.path.exists(pdf_path):
+                            try:
+                                os.remove(pdf_path)
+                            except Exception as e:
+                                st.warning(f"Could not delete file: {e}")
+                        st.success("Report deleted successfully.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to delete report: {e}")
+
+    if st.button("⬅️ Back to Home"):
+        st.query_params["page"] = "home"
+        st.rerun()
